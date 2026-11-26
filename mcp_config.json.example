@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "context": {
+      "command": "/ABSOLUTE/PATH/TO/.gemini/config/plugins/agy-context/.venv/Scripts/python.exe",
+      "args": [
+        "/ABSOLUTE/PATH/TO/.gemini/config/plugins/agy-context/server.py"
+      ]
+    }
+  }
+}
