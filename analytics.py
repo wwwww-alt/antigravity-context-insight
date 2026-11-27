@@ -4,11 +4,12 @@ import json
 import os
 import re
 import time
+import urllib.request
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 BRAIN_DIR = Path.home() / ".gemini" / "antigravity" / "brain"
 
@@ -36,8 +37,184 @@ MODEL_WINDOWS: dict[str, int] = {
 }
 
 # In-memory cache keyed by (path_str, mtime_ns, size)
-_SUMMARY_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
 _DETAIL_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
+_LS_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _ls_post(method: str, body: dict[str, Any] | None = None, ttl: float = 15.0) -> dict[str, Any] | None:
+    now = time.time()
+    cached = _LS_CACHE.get(method)
+    if cached and (now - cached[0]) < ttl:
+        return cached[1]
+    addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
+    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+    if not addr or not csrf:
+        return None
+    url = f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body or {}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": csrf,
+        },
+        method="POST",
+    )
+    try:
+        # Loopback: bypass any system proxy
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        _LS_CACHE[method] = (now, data)
+        return data
+    except Exception:
+        return None
+
+
+def _extract_project_name(workspaces: list[dict[str, Any]] | None) -> tuple[str, str]:
+    """Return (display_name, norm_key) merging case & collapsing /tmp."""
+    if not workspaces:
+        return ("未绑定项目", "__unbound__")
+    for ws in workspaces:
+        uri = str(ws.get("workspaceFolderAbsoluteUri") or ws.get("repository") or "").strip()
+        if not uri:
+            continue
+        p = unquote(uri)
+        if p.startswith("file:///"):
+            p = p[8:]
+        elif p.startswith("file://"):
+            p = p[7:]
+        p = p.rstrip("/\\")
+        if not p:
+            continue
+        low = p.lower()
+        if "/tmp" in low or "\\temp\\" in low or low.endswith("/tmp") or low.endswith("\\tmp"):
+            return ("/tmp", "/tmp")
+        name = Path(p.replace("\\", "/")).name or p
+        return (name, name.lower())
+    return ("未绑定项目", "__unbound__")
+
+
+def _fetch_ls_trajectories() -> dict[str, dict[str, Any]]:
+    data = _ls_post("GetAllCascadeTrajectories", {}, ttl=15.0)
+    if not data or not isinstance(data.get("trajectorySummaries"), dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for cid, meta in data["trajectorySummaries"].items():
+        if not isinstance(meta, dict):
+            continue
+        proj_name, proj_key = _extract_project_name(meta.get("workspaces"))
+        out[cid] = {
+            "summary": str(meta.get("summary") or "").strip(),
+            "project": proj_name,
+            "projectKey": proj_key,
+            "status": str(meta.get("status") or ""),
+        }
+    return out
+
+
+def _fetch_live_gemini_quota() -> dict[str, Any]:
+    data = _ls_post("GetUserStatus", {}, ttl=20.0)
+    result: dict[str, Any] = {
+        "available": False,
+        "remainingPct": None,
+        "consumedPct": None,
+        "resetTime": "",
+        "windowStartIso": "",
+        "windowEndIso": "",
+    }
+    if not data:
+        return result
+    configs = (
+        data.get("userStatus", {})
+        .get("cascadeModelConfigData", {})
+        .get("clientModelConfigs", [])
+    )
+    if not isinstance(configs, list):
+        return result
+    for cfg in configs:
+        label = str(cfg.get("label") or "")
+        q = cfg.get("quotaInfo") or {}
+        if "gemini" in label.lower() and isinstance(q.get("remainingFraction"), (int, float)):
+            rem = max(0.0, min(1.0, float(q["remainingFraction"])))
+            reset_ts = str(q.get("resetTime") or "")
+            win_start = ""
+            dt_reset = _parse_iso(reset_ts)
+            if dt_reset:
+                win_start = (dt_reset - timedelta(hours=5)).isoformat()
+            result.update(
+                {
+                    "available": True,
+                    "remainingPct": round(rem * 100.0, 1),
+                    "consumedPct": round((1.0 - rem) * 100.0, 1),
+                    "resetTime": reset_ts,
+                    "windowStartIso": win_start,
+                    "windowEndIso": reset_ts,
+                }
+            )
+            break
+    return result
+
+
+def format_model_name(model: str) -> str:
+    raw = (model or "").strip()
+    if not raw or raw == "unknown":
+        return "Unknown Model"
+    m = raw.lower()
+    # Normalize known Antigravity / Gemini / Claude / GPT model strings
+    tier_map = {
+        "xhigh": "XHigh",
+        "high": "High",
+        "medium": "Medium",
+        "low": "Low",
+    }
+    parts = m.split("-")
+    tier = ""
+    if parts and parts[-1] in tier_map:
+        tier = tier_map[parts[-1]]
+        parts = parts[:-1]
+    parts = [p for p in parts if p != "tiered"]
+
+    if parts and parts[0] == "gemini":
+        body = " ".join(p.capitalize() if not p[0].isdigit() else p for p in parts)
+        return f"{body} ({tier})" if tier else body
+    if parts and parts[0] == "claude":
+        body = " ".join(p.capitalize() if not p[0].isdigit() else p for p in parts)
+        return f"{body} ({tier})" if tier else body
+    if parts and parts[0] == "gpt":
+        body = "GPT-" + "-".join(parts[1:]).upper()
+        return f"{body} ({tier})" if tier else body
+    return raw
+
+
+def _is_gemini_model(model: str) -> bool:
+    m = (model or "").lower()
+    return ("gemini" in m) or ("neon" in m) or ("hydrogen" in m) or ("carbon" in m) or ("argon" in m)
+
+
+def _classify_scene(
+    *,
+    model_steps: int,
+    tool_calls: int,
+    subagent_count: int,
+    files_written: int,
+    commands_run: int,
+    peak_context: int,
+) -> str:
+    if subagent_count >= 2 and tool_calls >= 6:
+        return "多 Agent 协作"
+    if tool_calls >= max(3, int(model_steps * 0.55)) or commands_run >= 3:
+        return "工具执行轮次"
+    if files_written >= 2:
+        return "代码编写与编辑"
+    if peak_context >= 100_000:
+        return "长上下文分析"
+    return "对话与问答"
+
+
+def _weighted_tokens(input_billed: int, cache_read: int, output_tokens: int) -> int:
+    # Standard billing/quota equivalence: uncached input = 1x, cache read = 0.1x, output = 4x
+    return int(round(max(0, input_billed) + max(0, cache_read) * 0.1 + max(0, output_tokens) * 4.0))
 
 
 def _model_window(model: str) -> int:
@@ -54,7 +231,6 @@ def _est_tokens(text: Any) -> int:
     s = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
     if not s:
         return 0
-    # CJK chars ~1.3 chars/token, ASCII ~3.8 chars/token
     non_ascii = sum(1 for ch in s if ord(ch) > 127)
     ascii_len = len(s) - non_ascii
     return max(1, int(non_ascii * 0.78 + ascii_len / 3.8))
@@ -112,7 +288,6 @@ def _extract_program(cmdline: str) -> str:
     s = (cmdline or "").strip()
     if not s:
         return "shell"
-    # Strip leading PowerShell env assignments like $env:Path = ...;
     parts = re.split(r"\s*;\s*|\s*&&\s*", s)
     for part in parts:
         p = part.strip()
@@ -176,11 +351,11 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
     rows = _read_jsonl(path)
     title = ""
     models_seen: list[str] = []
+    model_step_counts: Counter[str] = Counter()
     last_model = ""
     first_ts = ""
     last_ts = ""
 
-    # Cumulative raw estimates per category
     cum = {
         "system": 0,
         "user": 0,
@@ -193,6 +368,9 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
     total_input_billed = 0
     total_cache_read = 0
     total_output_tokens = 0
+    gemini_input_billed = 0
+    gemini_cache_read = 0
+    gemini_output_tokens = 0
     peak_context = 0
     current_context = 0
     user_turns = 0
@@ -212,12 +390,11 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
     files_map: dict[str, dict[str, Any]] = {}
     commands: list[dict[str, Any]] = []
 
-    # Subagent / multi-agent tracking
     spawned_children: list[dict[str, Any]] = []
     child_role_by_id: dict[str, dict[str, Any]] = {}
     fleet_events: list[dict[str, Any]] = []
+    gemini_step_records: list[tuple[str, int]] = []  # (ts, weighted_tokens)
 
-    # Pending tool calls from the latest PLANNER_RESPONSE to correlate with MODEL/GENERIC responses
     pending_tools: list[dict[str, Any]] = []
     last_user_preview = ""
     new_in_this_step: list[str] = []
@@ -350,6 +527,8 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
             model = str(row.get("model") or last_model or "unknown")
             if model and model not in models_seen:
                 models_seen.append(model)
+            if model:
+                model_step_counts[model] += 1
             is_model_switch = bool(last_model and model and model != last_model)
             if is_model_switch:
                 events.append(
@@ -358,7 +537,7 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                         "turn": turn_index,
                         "kind": "switch",
                         "label": "切换模型",
-                        "detail": f"{last_model} → {model}",
+                        "detail": f"{format_model_name(last_model)} → {format_model_name(model)}",
                         "delta": 0,
                         "ts": ts,
                     }
@@ -373,6 +552,14 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
             total_input_billed += in_tok
             total_cache_read += cache_tok
             total_output_tokens += out_tok
+            if _is_gemini_model(model):
+                gemini_input_billed += in_tok
+                gemini_cache_read += cache_tok
+                gemini_output_tokens += out_tok
+                w_step = _weighted_tokens(in_tok, cache_tok, out_tok)
+                if ts and w_step > 0:
+                    gemini_step_records.append((ts, w_step))
+
             if prompt_tok > peak_context:
                 peak_context = prompt_tok
             if prompt_tok > 0:
@@ -402,11 +589,9 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                     }
                 )
 
-            # Scale estimated breakdown to actual prompt_tok so bar matches provider truth
             est_sum = sum(cum.values()) or 1
             target_total = prompt_tok if prompt_tok > 0 else est_sum
             scaled = {k: int(round(cum[k] * target_total / est_sum)) for k in cum}
-            # Fix rounding residue on largest bucket
             diff = target_total - sum(scaled.values())
             if diff != 0:
                 biggest = max(scaled, key=lambda k: scaled[k])
@@ -430,7 +615,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                 tool_names_this_step.append(tname)
                 pending_tools.append({"name": tname, "args": targs, "step": idx, "ts": ts})
 
-                # Track file activity from tool calls
                 if tname in ("read_file", "write_file", "edit_file"):
                     fpath = _unquote_arg(targs.get("Path") or targs.get("path"))
                     if fpath:
@@ -453,7 +637,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                             fentry["writes"] += 1
                         fentry["ops"].append({"step": idx, "tool": tname, "action": act, "ts": ts})
 
-                        # Detect SKILL.md load
                         sm = SKILL_PATH_RE.search(fpath)
                         if tname == "read_file" and sm:
                             sname = sm.group(1)
@@ -470,7 +653,9 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                                 }
                             )
                 elif tname in ("grep_search", "find_by_name", "list_dir"):
-                    spath = _unquote_arg(targs.get("SearchPath") or targs.get("SearchDirectory") or targs.get("DirectoryPath"))
+                    spath = _unquote_arg(
+                        targs.get("SearchPath") or targs.get("SearchDirectory") or targs.get("DirectoryPath")
+                    )
                     if spath:
                         fentry = files_map.setdefault(
                             spath,
@@ -518,7 +703,8 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                     "seq": model_steps,
                     "turn": turn_index,
                     "ts": ts,
-                    "model": model,
+                    "model": format_model_name(model),
+                    "rawModel": model,
                     "promptTokens": prompt_tok,
                     "inputTokens": in_tok,
                     "cacheReadTokens": cache_tok,
@@ -539,7 +725,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
             if prompt_tok > 0:
                 prev_prompt = prompt_tok
 
-            # Add assistant output tokens into cumulative for NEXT step
             think_tok = _est_tokens(thinking)
             ans_tok = _est_tokens(answer)
             tc_tok = _est_tokens(tcs)
@@ -562,7 +747,7 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                     "category": "assistant",
                     "kind": kinds[0] if kinds else "answer",
                     "kinds": kinds,
-                    "model": model,
+                    "model": format_model_name(model),
                     "title": (
                         f"回复 + {len(tcs)} 个工具"
                         if answer.strip() and tcs
@@ -606,7 +791,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
             else:
                 cum["tools"] += tok
 
-            # Detect subagent spawn response
             sm = SUBAGENT_CREATED_RE.search(raw_c)
             if sm:
                 try:
@@ -656,7 +840,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                 except Exception:
                     pass
 
-            # Detect run_command execution
             if tname == "run_command":
                 cmdline = _unquote_arg(targs.get("CommandLine"))
                 summary = _unquote_arg(targs.get("toolSummary"))
@@ -718,7 +901,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
                 }
             )
 
-    # Aggregate turn series from step series
     turns_map: dict[int, dict[str, Any]] = {}
     for s in step_series:
         tnum = s["turn"] or 1
@@ -745,7 +927,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
         prev_t_tok = item["promptTokens"]
         turn_series.append(item)
 
-    # Active wall duration
     dur_s = 0
     d_start, d_end = _parse_iso(first_ts), _parse_iso(last_ts)
     if d_start and d_end:
@@ -753,15 +934,27 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
 
     total_prompt_sum = total_input_billed + total_cache_read
     cache_hit_rate = round((total_cache_read / total_prompt_sum) * 100, 1) if total_prompt_sum > 0 else 0.0
-    model_win = _model_window(last_model)
+    dominant_raw = model_step_counts.most_common(1)[0][0] if model_step_counts else (last_model or "unknown")
+    dominant_display = format_model_name(dominant_raw)
+    model_win = _model_window(dominant_raw)
     occupancy_pct = round((current_context / model_win) * 100, 2) if model_win > 0 else 0.0
-
-    current_comp = step_series[-1]["composition"] if step_series else cum
     files_list = sorted(
         files_map.values(),
         key=lambda f: (f["reads"] + f["writes"] + f["searches"]),
         reverse=True,
     )
+    files_written = sum(1 for f in files_list if f["writes"] > 0)
+    scene = _classify_scene(
+        model_steps=model_steps,
+        tool_calls=tool_calls_total,
+        subagent_count=len(spawned_children),
+        files_written=files_written,
+        commands_run=len(commands),
+        peak_context=peak_context,
+    )
+    weighted_tok = _weighted_tokens(total_input_billed, total_cache_read, total_output_tokens)
+    gemini_weighted_tok = _weighted_tokens(gemini_input_billed, gemini_cache_read, gemini_output_tokens)
+    current_comp = step_series[-1]["composition"] if step_series else cum
 
     detail = {
         "conversationId": conv_id,
@@ -772,8 +965,10 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
         "lastTs": last_ts,
         "mtime": st.st_mtime,
         "durationSeconds": dur_s,
-        "model": last_model or "unknown",
-        "models": models_seen,
+        "model": dominant_display,
+        "rawModel": dominant_raw,
+        "models": [format_model_name(m) for m in models_seen],
+        "scene": scene,
         "modelWindow": model_win,
         "occupancyPct": occupancy_pct,
         "stats": {
@@ -788,6 +983,8 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
             "totalCacheRead": total_cache_read,
             "totalOutputTokens": total_output_tokens,
             "totalTokens": total_input_billed + total_cache_read + total_output_tokens,
+            "weightedTokens": weighted_tok,
+            "geminiWeightedTokens": gemini_weighted_tok,
             "cacheHitRate": cache_hit_rate,
             "subagentCount": len(spawned_children),
             "filesTouched": len(files_list),
@@ -807,6 +1004,7 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
         "dailyCalls": dict(daily_calls),
         "spawnedChildren": spawned_children,
         "fleetEvents": fleet_events[-200:],
+        "_geminiStepRecords": gemini_step_records,
     }
 
     _DETAIL_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, detail)
@@ -814,7 +1012,6 @@ def _parse_session_full(conv_id: str, path: Path) -> dict[str, Any]:
 
 
 def _build_parent_index(details: list[dict[str, Any]]) -> dict[str, tuple[str, dict[str, Any]]]:
-    """Map child_cid -> (parent_cid, spawn_info)."""
     parent_of: dict[str, tuple[str, dict[str, Any]]] = {}
     for d in details:
         for ch in d.get("spawnedChildren", []):
@@ -824,27 +1021,53 @@ def _build_parent_index(details: list[dict[str, Any]]) -> dict[str, tuple[str, d
     return parent_of
 
 
-def _load_recent_details(limit: int = 45) -> list[dict[str, Any]]:
+def _load_recent_details(limit: int = 60) -> list[dict[str, Any]]:
     files = _discover_transcript_files()[:limit]
     return [_parse_session_full(cid, p) for cid, p in files]
 
 
-def list_sessions_compact(limit: int = 45) -> list[dict[str, Any]]:
-    details = _load_recent_details(limit=limit)
+def _public_detail(d: dict[str, Any], ls_meta: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    out = {k: v for k, v in d.items() if not k.startswith("_")}
+    meta = ls_meta.get(d["conversationId"])
+    if meta:
+        if meta.get("summary"):
+            out["title"] = meta["summary"]
+        out["project"] = meta.get("project") or "未绑定项目"
+        out["projectKey"] = meta.get("projectKey") or "__unbound__"
+    else:
+        out["project"] = "未绑定项目"
+        out["projectKey"] = "__unbound__"
+    return out
+
+
+def list_sessions_compact(
+    limit: int = 50,
+    *,
+    details: list[dict[str, Any]] | None = None,
+    ls_meta: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if details is None:
+        details = _load_recent_details(limit=limit)
+    if ls_meta is None:
+        ls_meta = _fetch_ls_trajectories()
     parent_of = _build_parent_index(details)
     out = []
     for d in details:
         cid = d["conversationId"]
         pinfo = parent_of.get(cid)
+        meta = ls_meta.get(cid, {})
+        title = meta.get("summary") or d["title"]
         out.append(
             {
                 "conversationId": cid,
-                "title": (pinfo[1].get("role") + " · " + d["title"]) if pinfo else d["title"],
+                "title": (pinfo[1].get("role") + " · " + title) if pinfo else title,
+                "project": meta.get("project") or "未绑定项目",
                 "isSubagent": pinfo is not None,
                 "parentId": pinfo[0] if pinfo else None,
                 "role": pinfo[1].get("role") if pinfo else None,
                 "subagentType": pinfo[1].get("type") if pinfo else None,
                 "model": d["model"],
+                "scene": d["scene"],
                 "lastTs": d["lastTs"],
                 "mtime": d["mtime"],
                 "stats": d["stats"],
@@ -860,7 +1083,8 @@ def get_session_payload(conversation_id: str = "") -> dict[str, Any]:
     if not files:
         return {"ok": False, "error": "未找到任何 Antigravity 会话日志", "sessions": []}
 
-    details = [_parse_session_full(cid, p) for cid, p in files[:40]]
+    details = [_parse_session_full(cid, p) for cid, p in files[:50]]
+    ls_meta = _fetch_ls_trajectories()
     parent_of = _build_parent_index(details)
     by_id = {d["conversationId"]: d for d in details}
 
@@ -873,7 +1097,6 @@ def get_session_payload(conversation_id: str = "") -> dict[str, Any]:
             if cand.is_file():
                 target = _parse_session_full(conversation_id, cand)
     if target is None:
-        # Prefer the most recently active ROOT (non-subagent) conversation
         for d in details:
             if d["conversationId"] not in parent_of:
                 target = d
@@ -881,11 +1104,11 @@ def get_session_payload(conversation_id: str = "") -> dict[str, Any]:
         if target is None:
             target = details[0]
 
-    sessions = list_sessions_compact(limit=40)
-    fleet = build_fleet_payload(target["conversationId"], preloaded=by_id, parent_of=parent_of)
+    sessions = list_sessions_compact(limit=50, details=details, ls_meta=ls_meta)
+    fleet = build_fleet_payload(target["conversationId"], preloaded=by_id, parent_of=parent_of, ls_meta=ls_meta)
     return {
         "ok": True,
-        "session": target,
+        "session": _public_detail(target, ls_meta),
         "fleet": fleet,
         "sessions": sessions,
     }
@@ -896,14 +1119,16 @@ def build_fleet_payload(
     *,
     preloaded: dict[str, dict[str, Any]] | None = None,
     parent_of: dict[str, tuple[str, dict[str, Any]]] | None = None,
+    ls_meta: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if preloaded is None:
         details = _load_recent_details(limit=50)
         preloaded = {d["conversationId"]: d for d in details}
     if parent_of is None:
         parent_of = _build_parent_index(list(preloaded.values()))
+    if ls_meta is None:
+        ls_meta = _fetch_ls_trajectories()
 
-    # Walk up to root ancestor
     root_id = conversation_id
     visited_up = {root_id}
     while root_id in parent_of and parent_of[root_id][0] not in visited_up:
@@ -930,6 +1155,7 @@ def build_fleet_payload(
             return
         seen.add(cid)
         d = get_detail(cid)
+        meta = ls_meta.get(cid, {})
         if d:
             members.append(
                 {
@@ -940,7 +1166,7 @@ def build_fleet_payload(
                     "isCurrent": cid == conversation_id,
                     "role": (spawn_info or {}).get("role") or ("主 Agent" if depth == 0 else cid[:8]),
                     "subagentType": (spawn_info or {}).get("type") or ("coordinator" if depth == 0 else "subagent"),
-                    "title": d["title"],
+                    "title": meta.get("summary") or d["title"],
                     "model": d["model"],
                     "occupancyPct": d["occupancyPct"],
                     "currentContext": d["stats"]["currentContext"],
@@ -981,7 +1207,7 @@ def build_fleet_payload(
                     "role": (spawn_info or {}).get("role") or cid[:8],
                     "subagentType": (spawn_info or {}).get("type") or "subagent",
                     "title": (spawn_info or {}).get("role") or f"子 Agent {cid[:8]}",
-                    "model": (spawn_info or {}).get("requestedModel") or "unknown",
+                    "model": format_model_name((spawn_info or {}).get("requestedModel") or "unknown"),
                     "occupancyPct": 0.0,
                     "currentContext": 0,
                     "peakContext": 0,
@@ -1018,8 +1244,32 @@ def build_fleet_payload(
 
 
 def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[str, Any]:
-    details = _load_recent_details(limit=60)
+    details = _load_recent_details(limit=80)
+    ls_meta = _fetch_ls_trajectories()
+    live_quota = _fetch_live_gemini_quota()
     parent_of = _build_parent_index(details)
+    by_id = {d["conversationId"]: d for d in details}
+
+    # Calibrate weighted Gemini tokens per 1% of a 5h quota window using live GetUserStatus
+    tokens_per_1pct = 380_000.0
+    calibrated = False
+    win_start_dt = _parse_iso(live_quota.get("windowStartIso") or "")
+    win_end_dt = _parse_iso(live_quota.get("windowEndIso") or "")
+    session_window_weighted: dict[str, int] = defaultdict(int)
+    if live_quota.get("available") and win_start_dt and win_end_dt:
+        total_win_weighted = 0
+        for d in details:
+            cid = d["conversationId"]
+            for step_ts, w_tok in d.get("_geminiStepRecords", []):
+                sdt = _parse_iso(step_ts)
+                if sdt and win_start_dt <= sdt <= win_end_dt:
+                    session_window_weighted[cid] += w_tok
+                    total_win_weighted += w_tok
+        consumed_pct = float(live_quota.get("consumedPct") or 0.0)
+        if consumed_pct >= 1.0 and total_win_weighted >= 50_000:
+            raw_unit = total_win_weighted / consumed_pct
+            tokens_per_1pct = max(120_000.0, min(1_800_000.0, raw_unit))
+            calibrated = True
 
     now_local = datetime.now().astimezone()
     today_str = now_local.strftime("%Y-%m-%d")
@@ -1032,7 +1282,6 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
     else:
         cutoff_str = ""
 
-    # 56-day heatmap (last 8 weeks) across all sessions
     heatmap_totals: defaultdict[str, int] = defaultdict(int)
     heatmap_calls: defaultdict[str, int] = defaultdict(int)
     for d in details:
@@ -1044,27 +1293,13 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
     heatmap: list[dict[str, Any]] = []
     for i in range(55, -1, -1):
         day = (now_local - timedelta(days=i)).strftime("%Y-%m-%d")
-        heatmap.append(
-            {
-                "day": day,
-                "tokens": heatmap_totals.get(day, 0),
-                "calls": heatmap_calls.get(day, 0),
-            }
-        )
+        heatmap.append({"day": day, "tokens": heatmap_totals.get(day, 0), "calls": heatmap_calls.get(day, 0)})
 
-    last7: list[dict[str, Any]] = []
-    for i in range(6, -1, -1):
-        day = (now_local - timedelta(days=i)).strftime("%Y-%m-%d")
-        last7.append(
-            {
-                "day": day,
-                "label": day[5:],
-                "tokens": heatmap_totals.get(day, 0),
-                "calls": heatmap_calls.get(day, 0),
-            }
-        )
+    last7: list[dict[str, Any]] = [
+        {"day": h["day"], "label": h["day"][5:], "tokens": h["tokens"], "calls": h["calls"]}
+        for h in heatmap[-7:]
+    ]
 
-    # Filter sessions by range_key / day_filter
     filtered: list[dict[str, Any]] = []
     for d in details:
         s_days = set(d.get("dailyTokens", {}).keys())
@@ -1093,7 +1328,61 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
     agg_skills = Counter()
     agg_programs = Counter()
 
-    session_cards = []
+    def build_row(d: dict[str, Any], *, role_override: str | None = None, parent_id: str | None = None) -> dict[str, Any]:
+        cid = d["conversationId"]
+        st = d["stats"]
+        meta = ls_meta.get(cid, {})
+        proj = meta.get("project") or "未绑定项目"
+        proj_key = meta.get("projectKey") or "__unbound__"
+        if proj_key == "__unbound__" and parent_id and parent_id in ls_meta:
+            proj = ls_meta[parent_id].get("project") or proj
+            proj_key = ls_meta[parent_id].get("projectKey") or proj_key
+
+        gw = st["geminiWeightedTokens"]
+        g_pct = round(gw / tokens_per_1pct, 1) if gw > 0 else 0.0
+        win_w = session_window_weighted.get(cid, 0)
+        win_pct = round(win_w / tokens_per_1pct, 1) if win_w > 0 else 0.0
+
+        return {
+            "conversationId": cid,
+            "shortId": cid[:8],
+            "title": role_override or meta.get("summary") or d["title"],
+            "project": proj,
+            "projectKey": proj_key,
+            "isSubagent": parent_id is not None,
+            "parentId": parent_id,
+            "role": role_override,
+            "model": d["model"],
+            "scene": d["scene"],
+            "lastTs": d["lastTs"],
+            "durationSeconds": d["durationSeconds"],
+            "occupancyPct": d["occupancyPct"],
+            "calls": st["modelSteps"],
+            "totalTokens": st["totalTokens"],
+            "weightedTokens": st["weightedTokens"],
+            "inputBilled": st["totalInputBilled"],
+            "cacheRead": st["totalCacheRead"],
+            "outputTokens": st["totalOutputTokens"],
+            "cacheHitRate": st["cacheHitRate"],
+            "peakContext": st["peakContext"],
+            "geminiQuotaPct": g_pct,
+            "windowQuotaPct": win_pct,
+            "inCurrentWindow": win_w > 0,
+            "stats": st,
+            "currentComposition": d["currentComposition"],
+            "children": [],
+            "childCount": 0,
+        }
+
+    # Build top-level rows (root sessions roll up their child subagents into expandable rows!)
+    filtered_ids = {d["conversationId"] for d in filtered}
+    children_by_parent: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for d in details:
+        cid = d["conversationId"]
+        if cid in parent_of:
+            pid, spawn_info = parent_of[cid]
+            children_by_parent[pid].append(build_row(d, role_override=spawn_info.get("role") or cid[:8], parent_id=pid))
+
     for d in filtered:
         st = d["stats"]
         total_tokens += st["totalTokens"]
@@ -1113,23 +1402,105 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
         for item in d["topPrograms"]:
             agg_programs[item["name"]] += item["count"]
 
+    root_rows: list[dict[str, Any]] = []
+    for d in filtered:
         cid = d["conversationId"]
+        # Skip child subagents at top level if their parent is also in filtered
+        if cid in parent_of and parent_of[cid][0] in filtered_ids:
+            continue
         pinfo = parent_of.get(cid)
-        session_cards.append(
+        row = build_row(d, role_override=(pinfo[1].get("role") if pinfo else None), parent_id=(pinfo[0] if pinfo else None))
+        ch_list = children_by_parent.get(cid, [])
+        if ch_list:
+            # Roll up parent + children into parent's summary row (just like Image 1!)
+            row["children"] = sorted(ch_list, key=lambda x: x["totalTokens"], reverse=True)
+            row["childCount"] = len(ch_list)
+            roll_calls = row["calls"] + sum(c["calls"] for c in ch_list)
+            roll_in = row["inputBilled"] + sum(c["inputBilled"] for c in ch_list)
+            roll_cache = row["cacheRead"] + sum(c["cacheRead"] for c in ch_list)
+            roll_out = row["outputTokens"] + sum(c["outputTokens"] for c in ch_list)
+            roll_total = roll_in + roll_cache + roll_out
+            roll_weighted = row["weightedTokens"] + sum(c["weightedTokens"] for c in ch_list)
+            roll_gpct = round(row["geminiQuotaPct"] + sum(c["geminiQuotaPct"] for c in ch_list), 1)
+            roll_wpct = round(row["windowQuotaPct"] + sum(c["windowQuotaPct"] for c in ch_list), 1)
+            roll_prompt = roll_in + roll_cache
+            row["calls"] = roll_calls
+            row["inputBilled"] = roll_in
+            row["cacheRead"] = roll_cache
+            row["outputTokens"] = roll_out
+            row["totalTokens"] = roll_total
+            row["weightedTokens"] = roll_weighted
+            row["cacheHitRate"] = round((roll_cache / roll_prompt) * 100.0, 1) if roll_prompt > 0 else 0.0
+            row["geminiQuotaPct"] = roll_gpct
+            row["windowQuotaPct"] = roll_wpct
+            row["inCurrentWindow"] = row["inCurrentWindow"] or any(c["inCurrentWindow"] for c in ch_list)
+            if ch_list:
+                latest_child_ts = max((c["lastTs"] for c in ch_list if c["lastTs"]), default="")
+                if latest_child_ts > row["lastTs"]:
+                    row["lastTs"] = latest_child_ts
+        root_rows.append(row)
+
+    # Project rollup ("项目汇总")
+    proj_map: dict[str, dict[str, Any]] = {}
+    for r in root_rows:
+        pk = r["projectKey"]
+        p = proj_map.setdefault(
+            pk,
             {
-                "conversationId": cid,
-                "title": d["title"],
-                "isSubagent": pinfo is not None,
-                "parentId": pinfo[0] if pinfo else None,
-                "role": pinfo[1].get("role") if pinfo else None,
-                "model": d["model"],
-                "lastTs": d["lastTs"],
-                "durationSeconds": d["durationSeconds"],
-                "occupancyPct": d["occupancyPct"],
-                "stats": st,
-                "currentComposition": d["currentComposition"],
+                "projectKey": pk,
+                "project": r["project"],
+                "sessionCount": 0,
+                "subagentCount": 0,
+                "calls": 0,
+                "inputBilled": 0,
+                "cacheRead": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "weightedTokens": 0,
+                "geminiQuotaPct": 0.0,
+                "peakContext": 0,
+                "lastTs": "",
+                "_models": Counter(),
+            },
+        )
+        p["sessionCount"] += 1
+        p["subagentCount"] += r["childCount"]
+        p["calls"] += r["calls"]
+        p["inputBilled"] += r["inputBilled"]
+        p["cacheRead"] += r["cacheRead"]
+        p["outputTokens"] += r["outputTokens"]
+        p["totalTokens"] += r["totalTokens"]
+        p["weightedTokens"] += r["weightedTokens"]
+        p["geminiQuotaPct"] = round(p["geminiQuotaPct"] + r["geminiQuotaPct"], 1)
+        p["peakContext"] = max(p["peakContext"], r["peakContext"])
+        if r["lastTs"] > p["lastTs"]:
+            p["lastTs"] = r["lastTs"]
+        p["_models"][r["model"]] += max(1, r["calls"])
+
+    projects = []
+    for p in proj_map.values():
+        prompt_sum_p = p["inputBilled"] + p["cacheRead"]
+        dom_model = p["_models"].most_common(1)[0][0] if p["_models"] else "Unknown"
+        projects.append(
+            {
+                "projectKey": p["projectKey"],
+                "project": p["project"],
+                "sessionCount": p["sessionCount"],
+                "subagentCount": p["subagentCount"],
+                "dominantModel": dom_model,
+                "calls": p["calls"],
+                "inputBilled": p["inputBilled"],
+                "cacheRead": p["cacheRead"],
+                "outputTokens": p["outputTokens"],
+                "totalTokens": p["totalTokens"],
+                "weightedTokens": p["weightedTokens"],
+                "cacheHitRate": round((p["cacheRead"] / prompt_sum_p) * 100.0, 1) if prompt_sum_p > 0 else 0.0,
+                "geminiQuotaPct": p["geminiQuotaPct"],
+                "peakContext": p["peakContext"],
+                "lastTs": p["lastTs"],
             }
         )
+    projects.sort(key=lambda x: (x["projectKey"] == "__unbound__", -x["totalTokens"]))
 
     prompt_sum = total_in + total_cache
     cache_rate = round((total_cache / prompt_sum) * 100, 1) if prompt_sum > 0 else 0.0
@@ -1138,9 +1509,14 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
         "ok": True,
         "range": range_key,
         "dayFilter": day_filter,
+        "quota": {
+            **live_quota,
+            "calibrated": calibrated,
+            "tokensPer1Pct": int(round(tokens_per_1pct)),
+        },
         "kpi": {
             "sessions": len(filtered),
-            "rootSessions": sum(1 for c in session_cards if not c["isSubagent"]),
+            "rootSessions": len(root_rows),
             "totalTokens": total_tokens,
             "inputBilled": total_in,
             "cacheRead": total_cache,
@@ -1157,5 +1533,6 @@ def get_insights_payload(range_key: str = "30d", day_filter: str = "") -> dict[s
         "topTools": [{"name": k, "count": v} for k, v in agg_tools.most_common(12)],
         "topSkills": [{"name": k, "count": v} for k, v in agg_skills.most_common(12)],
         "topPrograms": [{"name": k, "count": v} for k, v in agg_programs.most_common(12)],
-        "sessions": session_cards,
+        "projects": projects,
+        "sessions": root_rows,
     }

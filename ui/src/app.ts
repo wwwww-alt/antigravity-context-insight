@@ -160,9 +160,66 @@ interface FleetData {
   }>;
 }
 
+interface SessionTableRow {
+  conversationId: string;
+  shortId: string;
+  title: string;
+  project: string;
+  projectKey: string;
+  isSubagent: boolean;
+  parentId: string | null;
+  role: string | null;
+  model: string;
+  scene: string;
+  lastTs: string;
+  durationSeconds: number;
+  occupancyPct: number;
+  calls: number;
+  totalTokens: number;
+  weightedTokens: number;
+  inputBilled: number;
+  cacheRead: number;
+  outputTokens: number;
+  cacheHitRate: number;
+  peakContext: number;
+  geminiQuotaPct: number;
+  windowQuotaPct: number;
+  inCurrentWindow: boolean;
+  stats: SessionDetail['stats'];
+  currentComposition: Composition;
+  children: SessionTableRow[];
+  childCount: number;
+}
+
+interface ProjectRow {
+  projectKey: string;
+  project: string;
+  sessionCount: number;
+  subagentCount: number;
+  dominantModel: string;
+  calls: number;
+  inputBilled: number;
+  cacheRead: number;
+  outputTokens: number;
+  totalTokens: number;
+  weightedTokens: number;
+  cacheHitRate: number;
+  geminiQuotaPct: number;
+  peakContext: number;
+  lastTs: string;
+}
+
 interface InsightsData {
   range: string;
   dayFilter: string;
+  quota?: {
+    available: boolean;
+    remainingPct: number | null;
+    consumedPct: number | null;
+    resetTime: string;
+    calibrated: boolean;
+    tokensPer1Pct: number;
+  };
   kpi: {
     sessions: number;
     rootSessions: number;
@@ -182,19 +239,8 @@ interface InsightsData {
   topTools: Array<{ name: string; count: number }>;
   topSkills: Array<{ name: string; count: number }>;
   topPrograms: Array<{ name: string; count: number }>;
-  sessions: Array<{
-    conversationId: string;
-    title: string;
-    isSubagent: boolean;
-    parentId: string | null;
-    role: string | null;
-    model: string;
-    lastTs: string;
-    durationSeconds: number;
-    occupancyPct: number;
-    stats: SessionDetail['stats'];
-    currentComposition: Composition;
-  }>;
+  projects?: ProjectRow[];
+  sessions: SessionTableRow[];
 }
 
 const state = {
@@ -239,8 +285,21 @@ const state = {
   // Insights controls
   insightsRange: '30d' as 'today' | '7d' | '30d' | 'all',
   insightsDay: '' as string,
+  insightsViewMode: 'sessions' as 'sessions' | 'projects',
+  insightsProject: 'all' as string,
   insightsSearch: '',
-  insightsSort: 'recent' as 'recent' | 'context' | 'tokens',
+  insightsSort: 'tokens' as
+    | 'tokens'
+    | 'weighted'
+    | 'uncached'
+    | 'output'
+    | 'calls'
+    | 'low_cache'
+    | 'quota'
+    | 'recent'
+    | 'peak',
+  onlyLowCache: false,
+  expandedParentIds: new Set<string>(),
 
   toast: '',
   toastTimer: 0,
@@ -285,6 +344,52 @@ function fmtTimeShort(ts: string): string {
   } catch {
     return ts.slice(0, 16);
   }
+}
+
+function fmtRelativeTime(ts: string): string {
+  if (!ts) return '—';
+  try {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return ts.slice(0, 16);
+    const now = new Date();
+    const pad = (x: number) => String(x).padStart(2, '0');
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startTarget = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const diffDays = Math.round((startToday - startTarget) / 86400000);
+    if (diffDays === 0) return `今天 ${hm}`;
+    if (diffDays === 1) return `昨天 ${hm}`;
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+  } catch {
+    return ts.slice(0, 16);
+  }
+}
+
+function fmtResetCountdown(ts: string): string {
+  if (!ts) return '';
+  try {
+    const ms = new Date(ts).getTime() - Date.now();
+    if (Number.isNaN(ms) || ms <= 0) return '即将重置';
+    const mins = Math.floor(ms / 60000);
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return h > 0 ? `${h}h ${m}m 后重置` : `${m}m 后重置`;
+  } catch {
+    return '';
+  }
+}
+
+function renderTokenMixBar(inputBilled: number, cacheRead: number, outputTokens: number): string {
+  const total = Math.max(1, (inputBilled || 0) + (cacheRead || 0) + (outputTokens || 0));
+  const pIn = ((inputBilled || 0) / total) * 100;
+  const pCache = ((cacheRead || 0) / total) * 100;
+  const pOut = ((outputTokens || 0) / total) * 100;
+  const tip = `未缓存输入 ${fmtTok(inputBilled)} (${pIn.toFixed(1)}%) · 缓存读取 ${fmtTok(cacheRead)} (${pCache.toFixed(1)}%) · 输出 ${fmtTok(outputTokens)} (${pOut.toFixed(1)}%)`;
+  return `<div class="mix-bar" title="${esc(tip)}">
+    ${pIn > 0 ? `<span class="mix-in" style="width:${Math.max(2, pIn).toFixed(1)}%"></span>` : ''}
+    ${pCache > 0 ? `<span class="mix-cache" style="width:${pCache.toFixed(1)}%"></span>` : ''}
+    ${pOut > 0 ? `<span class="mix-out" style="width:${Math.max(1, pOut).toFixed(1)}%"></span>` : ''}
+  </div>`;
 }
 
 function showToast(msg: string) {
@@ -986,10 +1091,88 @@ function renderFleetView(): string {
   `;
 }
 
+function renderMetricDisplay(row: {
+  totalTokens: number;
+  weightedTokens: number;
+  inputBilled: number;
+  outputTokens: number;
+}): { val: string; sub: string } {
+  switch (state.insightsSort) {
+    case 'weighted':
+      return { val: fmtTok(row.weightedTokens), sub: `总 ${fmtTok(row.totalTokens)}` };
+    case 'uncached':
+      return { val: fmtTok(row.inputBilled), sub: `总 ${fmtTok(row.totalTokens)}` };
+    case 'output':
+      return { val: fmtTok(row.outputTokens), sub: `总 ${fmtTok(row.totalTokens)}` };
+    default:
+      return { val: fmtTok(row.totalTokens), sub: '' };
+  }
+}
+
+function renderSessionTableRow(r: SessionTableRow, isChild = false): string {
+  const hasChildren = !isChild && (r.childCount || 0) > 0;
+  const expanded = hasChildren && state.expandedParentIds.has(r.conversationId);
+  const lowCache = r.cacheHitRate < 80;
+  const metric = renderMetricDisplay(r);
+  const gPct = Number(r.geminiQuotaPct || 0);
+  const gBarW = Math.min(100, Math.max(gPct > 0 ? 4 : 0, gPct));
+  const quotaTip = r.inCurrentWindow
+    ? `本次会话累计等效约占单次 5h Gemini 额度的 ${gPct.toFixed(1)}%（当前 5h 窗口内占比 ${Number(r.windowQuotaPct || 0).toFixed(1)}%）`
+    : `估算约占单次 5h Gemini 额度的 ${gPct.toFixed(1)}%（按加权等效 Token 校准）`;
+
+  const rowHtml = `
+    <tr class="st-row ${isChild ? 'st-child' : ''}" data-action="open-session" data-id="${esc(r.conversationId)}">
+      <td class="col-session">
+        <div class="sess-cell">
+          ${
+            hasChildren
+              ? `<button class="exp-btn" data-action="toggle-parent" data-id="${esc(r.conversationId)}" data-stop="1" title="${expanded ? '收起子 Agent 轨迹' : '展开子 Agent 轨迹'}">${expanded ? '▾' : '▸'}</button>`
+              : `<span class="exp-spacer">${isChild ? '↳' : ''}</span>`
+          }
+          <div class="sess-info">
+            <div class="sess-name" title="${esc(r.title)}">${esc(r.title)}</div>
+            <div class="sess-tags">
+              ${!isChild ? `<span class="proj-tag">${esc(r.project)}</span>` : '<span class="sub-tag">子 Agent</span>'}
+              ${hasChildren ? `<span class="child-pill">含 ${r.childCount} 个子 Agent</span>` : ''}
+              <span class="short-id">${esc(r.shortId)}</span>
+            </div>
+          </div>
+        </div>
+      </td>
+      <td class="col-model">
+        <div class="model-main">${esc(r.model)}</div>
+        <div class="model-scene">${esc(r.scene || '工具执行轮次')}</div>
+      </td>
+      <td class="col-num">${r.calls}</td>
+      <td class="col-consume">
+        <div class="consume-top">
+          ${metric.sub ? `<span class="consume-sub">${esc(metric.sub)}</span>` : ''}
+          <strong>${esc(metric.val)}</strong>
+        </div>
+        ${renderTokenMixBar(r.inputBilled, r.cacheRead, r.outputTokens)}
+      </td>
+      <td class="col-num ${lowCache ? 'txt-warn' : ''}">${r.cacheHitRate.toFixed(1)}%</td>
+      <td class="col-quota" title="${esc(quotaTip)}">
+        <div class="quota-top">
+          ${r.inCurrentWindow ? '<span class="win-dot" title="当前 5h 额度窗口内活跃"></span>' : ''}
+          <strong>${gPct > 0 ? `${gPct.toFixed(1)}%` : '—'}</strong>
+        </div>
+        ${gPct > 0 ? `<div class="quota-bar"><span style="width:${gBarW.toFixed(1)}%"></span></div>` : ''}
+      </td>
+      <td class="col-time">${esc(fmtRelativeTime(r.lastTs))}</td>
+    </tr>
+  `;
+
+  if (!expanded || !r.children?.length) return rowHtml;
+  return rowHtml + r.children.map((ch) => renderSessionTableRow(ch, true)).join('');
+}
+
 function renderInsightsView(): string {
   const ins = state.insights;
   if (!ins) return '<div class="empty-panel">正在加载跨会话洞察…</div>';
   const kpi = ins.kpi;
+  const quota = ins.quota;
+  const projects = ins.projects || [];
 
   // 7-day SVG chart
   const max7 = Math.max(1000, ...ins.last7Days.map((d) => d.tokens));
@@ -1019,13 +1202,77 @@ function renderInsightsView(): string {
     .join('');
 
   const q = state.insightsSearch.trim().toLowerCase();
+
+  const sortCmp = (
+    a: {
+      totalTokens: number;
+      weightedTokens: number;
+      inputBilled: number;
+      outputTokens: number;
+      calls: number;
+      cacheHitRate: number;
+      geminiQuotaPct: number;
+      peakContext: number;
+      lastTs: string;
+    },
+    b: {
+      totalTokens: number;
+      weightedTokens: number;
+      inputBilled: number;
+      outputTokens: number;
+      calls: number;
+      cacheHitRate: number;
+      geminiQuotaPct: number;
+      peakContext: number;
+      lastTs: string;
+    },
+  ): number => {
+    switch (state.insightsSort) {
+      case 'weighted':
+        return b.weightedTokens - a.weightedTokens;
+      case 'uncached':
+        return b.inputBilled - a.inputBilled;
+      case 'output':
+        return b.outputTokens - a.outputTokens;
+      case 'calls':
+        return b.calls - a.calls;
+      case 'low_cache':
+        return a.cacheHitRate - b.cacheHitRate;
+      case 'quota':
+        return b.geminiQuotaPct - a.geminiQuotaPct;
+      case 'peak':
+        return b.peakContext - a.peakContext;
+      case 'recent':
+        return String(b.lastTs).localeCompare(String(a.lastTs));
+      case 'tokens':
+      default:
+        return b.totalTokens - a.totalTokens;
+    }
+  };
+
   const sessList = [...ins.sessions]
-    .filter((s) => !q || s.title.toLowerCase().includes(q) || s.model.toLowerCase().includes(q) || s.conversationId.includes(q))
-    .sort((a, b) => {
-      if (state.insightsSort === 'context') return b.stats.peakContext - a.stats.peakContext;
-      if (state.insightsSort === 'tokens') return b.stats.totalTokens - a.stats.totalTokens;
-      return String(b.lastTs).localeCompare(String(a.lastTs));
-    });
+    .filter((s) => {
+      if (state.insightsProject !== 'all' && s.projectKey !== state.insightsProject) return false;
+      if (state.onlyLowCache && s.cacheHitRate >= 80) return false;
+      if (q) {
+        const hay = `${s.title} ${s.project} ${s.shortId} ${s.conversationId} ${s.model} ${s.scene}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    })
+    .sort(sortCmp);
+
+  const projList = [...projects]
+    .filter((p) => {
+      if (state.onlyLowCache && p.cacheHitRate >= 80) return false;
+      if (q && !`${p.project} ${p.dominantModel}`.toLowerCase().includes(q)) return false;
+      return true;
+    })
+    .sort(sortCmp);
+
+  const lowCacheCount = ins.sessions.filter((s) => s.cacheHitRate < 80).length;
+  const resetHint = quota?.resetTime ? fmtResetCountdown(quota.resetTime) : '';
+  const totalRangeQuota = ins.sessions.reduce((acc, s) => acc + (s.geminiQuotaPct || 0), 0);
 
   return `
     <div class="view-scroll">
@@ -1057,20 +1304,153 @@ function renderInsightsView(): string {
         </div>
         <div class="kpi-card">
           <div class="kpi-lbl">全局缓存命中率</div>
-          <div class="kpi-val txt-ok">${kpi.cacheHitRate}%</div>
+          <div class="kpi-val ${kpi.cacheHitRate < 80 ? 'txt-warn' : 'txt-ok'}">${kpi.cacheHitRate}%</div>
           <div class="kpi-sub">${kpi.modelSteps} 次模型调用 · ${kpi.userTurns} 轮对话</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-lbl">活跃会话</div>
-          <div class="kpi-val">${kpi.sessions}</div>
-          <div class="kpi-sub">${kpi.rootSessions} 主会话 · ${kpi.subagents} 次子 Agent 派发</div>
+          <div class="kpi-lbl">Gemini 5h 实时额度</div>
+          <div class="kpi-val ${quota?.available && (quota.consumedPct || 0) >= 80 ? 'txt-warn' : ''}">${
+            quota?.available ? `已用 ${quota.consumedPct}%` : `约 ${totalRangeQuota.toFixed(0)}%`
+          }</div>
+          <div class="kpi-sub">${
+            quota?.available
+              ? `剩余 <strong>${quota.remainingPct}%</strong>${resetHint ? ` · ${esc(resetHint)}` : ''}`
+              : '按加权等效 Token 估算（未连 LS）'
+          }</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-lbl">工具执行总计</div>
-          <div class="kpi-val">${kpi.toolCalls}</div>
-          <div class="kpi-sub">跨全部本地 Antigravity 会话汇总</div>
+          <div class="kpi-lbl">活跃会话</div>
+          <div class="kpi-val">${kpi.rootSessions} <span class="kpi-unit">主会话</span></div>
+          <div class="kpi-sub">共 ${kpi.sessions} 轨迹 · ${kpi.subagents} 子 Agent · ${kpi.toolCalls} 工具</div>
         </div>
       </div>
+
+      <section class="panel-card stats-table-card">
+        <div class="st-header">
+          <div>
+            <h2>按会话与项目统计</h2>
+            <div class="card-sub">同名项目已合并大小写并折叠 /tmp，支持父会话展开子 Agent 轨迹</div>
+          </div>
+          <div class="view-switch">
+            <button class="sw-btn ${state.insightsViewMode === 'sessions' ? 'active' : ''}" data-action="ins-view-mode" data-val="sessions">会话明细</button>
+            <button class="sw-btn ${state.insightsViewMode === 'projects' ? 'active' : ''}" data-action="ins-view-mode" data-val="projects">项目汇总</button>
+          </div>
+        </div>
+
+        ${
+          state.insightsViewMode === 'sessions'
+            ? `<div class="proj-pills">
+                <button class="proj-pill ${state.insightsProject === 'all' ? 'active' : ''}" data-action="ins-project" data-val="all">全部项目</button>
+                ${projects
+                  .map(
+                    (p) =>
+                      `<button class="proj-pill ${state.insightsProject === p.projectKey ? 'active' : ''}" data-action="ins-project" data-val="${esc(p.projectKey)}">${esc(p.project)}</button>`,
+                  )
+                  .join('')}
+              </div>`
+            : ''
+        }
+
+        <div class="st-toolbar">
+          <div class="st-search-wrap">
+            <span class="st-search-ico">🔍</span>
+            <input id="ins-search" class="st-search" type="search" placeholder="搜索会话标题、项目名或 ID..." value="${esc(state.insightsSearch)}" />
+          </div>
+          <select id="ins-sort-select" class="st-select" title="切换排序维度">
+            <option value="tokens" ${state.insightsSort === 'tokens' ? 'selected' : ''}>排序：总 Tokens</option>
+            <option value="weighted" ${state.insightsSort === 'weighted' ? 'selected' : ''}>排序：加权等效</option>
+            <option value="uncached" ${state.insightsSort === 'uncached' ? 'selected' : ''}>排序：未缓存输入</option>
+            <option value="output" ${state.insightsSort === 'output' ? 'selected' : ''}>排序：输出 Tokens</option>
+            <option value="calls" ${state.insightsSort === 'calls' ? 'selected' : ''}>排序：调用次数</option>
+            <option value="low_cache" ${state.insightsSort === 'low_cache' ? 'selected' : ''}>排序：低缓存命中优先</option>
+            <option value="quota" ${state.insightsSort === 'quota' ? 'selected' : ''}>排序：Gemini 额度消耗</option>
+            <option value="recent" ${state.insightsSort === 'recent' ? 'selected' : ''}>排序：最近活跃</option>
+            <option value="peak" ${state.insightsSort === 'peak' ? 'selected' : ''}>排序：窗口峰值</option>
+          </select>
+          <label class="low-cache-toggle ${state.onlyLowCache ? 'active' : ''}">
+            <input id="low-cache-check" type="checkbox" ${state.onlyLowCache ? 'checked' : ''} />
+            <span>仅低缓存预警 (&lt;80%)${lowCacheCount > 0 ? ` (${lowCacheCount})` : ''}</span>
+          </label>
+        </div>
+
+        <div class="table-wrap">
+          ${
+            state.insightsViewMode === 'sessions'
+              ? sessList.length === 0
+                ? '<div class="empty-inline">当前筛选条件下暂无匹配会话。</div>'
+                : `<table class="stats-table">
+                    <thead>
+                      <tr>
+                        <th class="col-session">会话 / 项目</th>
+                        <th class="col-model">主力模型 &amp; 场景</th>
+                        <th class="col-num">调用</th>
+                        <th class="col-consume">消耗与构成</th>
+                        <th class="col-num">缓存命中</th>
+                        <th class="col-quota">Gemini 额度</th>
+                        <th class="col-time">最近活跃</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${sessList.map((r) => renderSessionTableRow(r, false)).join('')}
+                    </tbody>
+                  </table>`
+              : projList.length === 0
+                ? '<div class="empty-inline">当前筛选条件下暂无匹配项目。</div>'
+                : `<table class="stats-table">
+                    <thead>
+                      <tr>
+                        <th class="col-session">项目</th>
+                        <th class="col-model">主力模型</th>
+                        <th class="col-num">调用</th>
+                        <th class="col-consume">消耗与构成</th>
+                        <th class="col-num">缓存命中</th>
+                        <th class="col-quota">Gemini 额度</th>
+                        <th class="col-time">最近活跃</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${projList
+                        .map((p) => {
+                          const metric = renderMetricDisplay(p);
+                          const lowCache = p.cacheHitRate < 80;
+                          const gBarW = Math.min(100, Math.max(p.geminiQuotaPct > 0 ? 4 : 0, p.geminiQuotaPct));
+                          return `
+                            <tr class="st-row" data-action="drill-project" data-val="${esc(p.projectKey)}">
+                              <td class="col-session">
+                                <div class="sess-info">
+                                  <div class="sess-name">${esc(p.project)}</div>
+                                  <div class="sess-tags">
+                                    <span class="proj-tag">${p.sessionCount} 个主会话</span>
+                                    ${p.subagentCount > 0 ? `<span class="child-pill">含 ${p.subagentCount} 个子 Agent</span>` : ''}
+                                  </div>
+                                </div>
+                              </td>
+                              <td class="col-model">
+                                <div class="model-main">${esc(p.dominantModel)}</div>
+                                <div class="model-scene">项目汇总</div>
+                              </td>
+                              <td class="col-num">${p.calls}</td>
+                              <td class="col-consume">
+                                <div class="consume-top">
+                                  ${metric.sub ? `<span class="consume-sub">${esc(metric.sub)}</span>` : ''}
+                                  <strong>${esc(metric.val)}</strong>
+                                </div>
+                                ${renderTokenMixBar(p.inputBilled, p.cacheRead, p.outputTokens)}
+                              </td>
+                              <td class="col-num ${lowCache ? 'txt-warn' : ''}">${p.cacheHitRate.toFixed(1)}%</td>
+                              <td class="col-quota">
+                                <div class="quota-top"><strong>${p.geminiQuotaPct > 0 ? `${p.geminiQuotaPct.toFixed(1)}%` : '—'}</strong></div>
+                                ${p.geminiQuotaPct > 0 ? `<div class="quota-bar"><span style="width:${gBarW.toFixed(1)}%"></span></div>` : ''}
+                              </td>
+                              <td class="col-time">${esc(fmtRelativeTime(p.lastTs))}</td>
+                            </tr>`;
+                        })
+                        .join('')}
+                    </tbody>
+                  </table>`
+          }
+        </div>
+      </section>
 
       <div class="two-col">
         <section class="panel-card">
@@ -1104,39 +1484,6 @@ function renderInsightsView(): string {
           </div>
         </section>
       </div>
-
-      <section class="panel-card">
-        <div class="card-head">
-          <h2>💬 会话列表 (${sessList.length})</h2>
-          <div class="seg-group">
-            <input id="ins-search" class="input sm" type="search" placeholder="搜索会话标题或模型…" value="${esc(state.insightsSearch)}" />
-            <button class="chip ${state.insightsSort === 'recent' ? 'active' : ''}" data-action="ins-sort" data-val="recent">最近</button>
-            <button class="chip ${state.insightsSort === 'context' ? 'active' : ''}" data-action="ins-sort" data-val="context">窗口峰值</button>
-            <button class="chip ${state.insightsSort === 'tokens' ? 'active' : ''}" data-action="ins-sort" data-val="tokens">总 Token</button>
-          </div>
-        </div>
-        <div class="session-grid">
-          ${sessList
-            .map(
-              (c) => `
-              <div class="session-card" data-action="open-session" data-id="${esc(c.conversationId)}">
-                <div class="sess-top">
-                  <span class="sess-title">${esc(c.title)}</span>
-                  ${c.isSubagent ? `<span class="badge badge-subagent">子Agent</span>` : ''}
-                  ${c.stats.subagentCount > 0 ? `<span class="badge badge-global">🤖 ${c.stats.subagentCount}</span>` : ''}
-                </div>
-                <div class="sess-meta">
-                  <span><code>${esc(c.model)}</code></span>
-                  <span>峰值 ${fmtTok(c.stats.peakContext)} (${c.occupancyPct}%)</span>
-                  <span>总计 ${fmtTok(c.stats.totalTokens)}</span>
-                  <span>${fmtTimeShort(c.lastTs)}</span>
-                </div>
-                ${renderMiniCompBar(c.currentComposition, 6)}
-              </div>`,
-            )
-            .join('')}
-        </div>
-      </section>
     </div>
   `;
 }
@@ -1206,9 +1553,15 @@ function render() {
 }
 
 document.addEventListener('change', (e) => {
-  const t = e.target as HTMLSelectElement;
+  const t = e.target as HTMLInputElement | HTMLSelectElement;
   if (t.id === 'session-select' && t.value) {
     void loadSession(t.value);
+  } else if (t.id === 'ins-sort-select') {
+    state.insightsSort = (t.value as any) || 'tokens';
+    render();
+  } else if (t.id === 'low-cache-check') {
+    state.onlyLowCache = (t as HTMLInputElement).checked;
+    render();
   }
 });
 
@@ -1362,9 +1715,29 @@ document.addEventListener('click', (e) => {
       void loadInsights(state.insightsRange, '');
       break;
     case 'ins-sort':
-      state.insightsSort = (el.dataset.val as any) || 'recent';
+      state.insightsSort = (el.dataset.val as any) || 'tokens';
       render();
       break;
+    case 'ins-view-mode':
+      state.insightsViewMode = (el.dataset.val as 'sessions' | 'projects') || 'sessions';
+      render();
+      break;
+    case 'ins-project':
+      state.insightsProject = el.dataset.val || 'all';
+      render();
+      break;
+    case 'drill-project':
+      state.insightsProject = el.dataset.val || 'all';
+      state.insightsViewMode = 'sessions';
+      render();
+      break;
+    case 'toggle-parent': {
+      const id = el.dataset.id || '';
+      if (state.expandedParentIds.has(id)) state.expandedParentIds.delete(id);
+      else state.expandedParentIds.add(id);
+      render();
+      break;
+    }
   }
 });
 

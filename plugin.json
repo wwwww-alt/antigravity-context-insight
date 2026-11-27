@@ -1,7 +1,7 @@
 {
   "name": "agy-context",
   "displayName": "Context Insight",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Antigravity 上下文洞察与多 Agent 编队分析插件（适配自 dsh-context）：透视上下文组成、逐轮 Token 演进、缓存命中率、文件与命令活动，以及父子 Subagent 协作网络。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
